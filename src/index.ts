@@ -1,6 +1,13 @@
 import { Interface, JsonRpcProvider } from "ethers";
 import { existsSync } from "node:fs";
-import { readFile, writeFile, appendFile, mkdir } from "node:fs/promises";
+import {
+  readFile,
+  writeFile,
+  appendFile,
+  mkdir,
+  open,
+  unlink,
+} from "node:fs/promises";
 import path from "node:path";
 
 // RPC endpoint and starting block for backfill.
@@ -32,6 +39,12 @@ type TransferEventRecord = {
   from: string;
   to: string;
   value: string;
+  instanceId: string;
+};
+
+type ShardConfig = {
+  shardCount: number;
+  shardIndex: number;
 };
 
 // Simple async sleep helper for polling.
@@ -48,6 +61,35 @@ const logInfo = (message: string, details?: Record<string, unknown>) => {
   }
 };
 
+// Resolve shard config from environment variables.
+const getShardConfig = (): ShardConfig => {
+  const shardCount = Number.parseInt(process.env.SHARD_COUNT ?? "1", 10);
+  const shardIndex = Number.parseInt(process.env.SHARD_INDEX ?? "0", 10);
+
+  if (!Number.isFinite(shardCount) || shardCount <= 0) {
+    throw new Error("SHARD_COUNT must be a positive integer");
+  }
+  if (!Number.isFinite(shardIndex) || shardIndex < 0) {
+    throw new Error("SHARD_INDEX must be a non-negative integer");
+  }
+  if (shardIndex >= shardCount) {
+    throw new Error("SHARD_INDEX must be smaller than SHARD_COUNT");
+  }
+
+  return { shardCount, shardIndex };
+};
+
+// Resolve an instance id (used for event attribution and state tracking).
+const getInstanceId = (config: ShardConfig) =>
+  process.env.INSTANCE_ID ?? `shard-${config.shardIndex}`;
+
+// Decide if a log belongs to this shard based on log index.
+const shouldProcessLog = (
+  logIndex: number,
+  shardCount: number,
+  shardIndex: number
+) => logIndex % shardCount === shardIndex;
+
 // Read the ABI from disk.
 const loadAbi = async () => {
   const raw = await readFile(ABI_PATH, "utf-8");
@@ -59,8 +101,10 @@ const ensureStorage = async () => {
   await mkdir(DATA_DIR, { recursive: true });
 
   if (!existsSync(STATE_PATH)) {
-    const initialState: State = { lastProcessedBlock: INIT_BLOCK - 1 };
-    await writeFile(STATE_PATH, JSON.stringify(initialState, null, 2));
+    await writeFile(
+      STATE_PATH,
+      JSON.stringify({ instances: {} }, null, 2)
+    );
   }
 
   if (!existsSync(EVENTS_PATH)) {
@@ -68,24 +112,56 @@ const ensureStorage = async () => {
   }
 };
 
-// Read last processed block from disk with a safe fallback.
-const loadState = async (): Promise<State> => {
+// Acquire a very small file lock to serialize state writes between instances.
+const withStateLock = async <T>(action: () => Promise<T>): Promise<T> => {
+  const lockPath = path.join(DATA_DIR, "state.lock");
+  while (true) {
+    try {
+      const handle = await open(lockPath, "wx");
+      await handle.close();
+      break;
+    } catch {
+      // Another instance holds the lock; wait and retry.
+      await delay(150);
+    }
+  }
+
+  try {
+    return await action();
+  } finally {
+    await unlink(lockPath).catch(() => undefined);
+  }
+};
+
+// Read last processed block for this instance with a safe fallback.
+const loadState = async (instanceId: string): Promise<State> => {
   try {
     const raw = await readFile(STATE_PATH, "utf-8");
     const parsed = JSON.parse(raw);
-    if (typeof parsed.lastProcessedBlock !== "number") {
+    const instanceMap = parsed?.instances ?? {};
+    const lastProcessedBlock = instanceMap[instanceId];
+    if (typeof lastProcessedBlock !== "number") {
       throw new Error("Invalid state shape");
     }
-    return parsed;
+    return { lastProcessedBlock };
   } catch {
     return { lastProcessedBlock: INIT_BLOCK - 1 };
   }
 };
 
-// Persist last processed block to disk.
-const saveState = async (lastProcessedBlock: number) => {
-  const state: State = { lastProcessedBlock };
-  await writeFile(STATE_PATH, JSON.stringify(state, null, 2));
+// Persist last processed block for this instance to disk.
+const saveState = async (instanceId: string, lastProcessedBlock: number) => {
+  await withStateLock(async () => {
+    const raw = await readFile(STATE_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    const instances = parsed?.instances ?? {};
+
+    instances[instanceId] = lastProcessedBlock;
+    await writeFile(
+      STATE_PATH,
+      JSON.stringify({ instances }, null, 2)
+    );
+  });
 };
 
 // Append each event as a JSON line for easy streaming writes.
@@ -101,6 +177,8 @@ const getConfirmedHead = async (provider: JsonRpcProvider) => {
 
 // Main polling loop.
 const main = async () => {
+  const shardConfig = getShardConfig();
+  const instanceId = getInstanceId(shardConfig);
   await ensureStorage();
 
   const abi = await loadAbi();
@@ -113,7 +191,7 @@ const main = async () => {
   const provider = new JsonRpcProvider(RPC_URL);
 
   // Resume from last processed block to enable recovery.
-  let { lastProcessedBlock } = await loadState();
+  let { lastProcessedBlock } = await loadState(instanceId);
   logInfo("Indexer starting", {
     rpcUrl: RPC_URL,
     token: TOKEN_ADDRESS,
@@ -121,6 +199,11 @@ const main = async () => {
     batchSize: BATCH_SIZE,
     pollIntervalMs: POLL_INTERVAL_MS,
     lastProcessedBlock,
+    shardCount: shardConfig.shardCount,
+    shardIndex: shardConfig.shardIndex,
+    instanceId,
+    statePath: STATE_PATH,
+    eventsPath: EVENTS_PATH,
   });
 
   while (true) {
@@ -160,8 +243,19 @@ const main = async () => {
         logInfo("Logs fetched", { count: logs.length });
 
         let processedEvents = 0;
+        let skippedEvents = 0;
         for (const log of logs) {
           try {
+            if (
+              !shouldProcessLog(
+                log.index,
+                shardConfig.shardCount,
+                shardConfig.shardIndex
+              )
+            ) {
+              skippedEvents += 1;
+              continue;
+            }
             // Decode and persist each log independently.
             const parsed = iface.parseLog(log);
             if (!parsed) {
@@ -176,6 +270,7 @@ const main = async () => {
               from: parsed.args.from,
               to: parsed.args.to,
               value: parsed.args.value.toString(),
+              instanceId,
             };
 
             await appendEvent(record);
@@ -192,11 +287,12 @@ const main = async () => {
 
         // Persist progress for recovery.
         lastProcessedBlock = toBlock;
-        await saveState(lastProcessedBlock);
+        await saveState(instanceId, lastProcessedBlock);
         logInfo("Batch stored", {
           fromBlock,
           toBlock,
           processedEvents,
+          skippedEvents,
         });
       } else {
         logInfo("No confirmed blocks to process; waiting", {

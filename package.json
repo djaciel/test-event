@@ -5,7 +5,9 @@
   "type": "commonjs",
   "scripts": {
     "build": "tsc",
-    "start": "ts-node src/index.ts"
+    "start": "ts-node src/index.ts",
+    "start:instance0": "SHARD_COUNT=2 SHARD_INDEX=0 INSTANCE_ID=instance-0 ts-node src/index.ts",
+    "start:instance1": "SHARD_COUNT=2 SHARD_INDEX=1 INSTANCE_ID=instance-1 ts-node src/index.ts"
   },
   "dependencies": {
     "ethers": "^6.16.0"
